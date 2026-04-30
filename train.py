@@ -1,6 +1,7 @@
 import torch
 from datasets import load_dataset
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -12,7 +13,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import os
 
 # --- 設定 ---
-MODEL_ID = "p1atypus/GPT-OSS-20B" # またはローカルパス
+MODEL_ID = "openai/gpt-oss-20b" # またはローカルパス
 DATA_PATH = "train_data.jsonl"
 OUTPUT_DIR = "./output-skeptical-core"
 
@@ -30,6 +31,14 @@ def train():
     tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
 
     # 3. モデルのロード (4-bit量子化 & マルチGPU分散)
+    # 既存のconfigを読み込み、もし量子化設定があれば消去する
+    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
+    if hasattr(config, "quantization_config"):
+        print(f"Detected existing quantization config: {config.quantization_config}")
+        print("Overriding with BitsAndBytesConfig for QLoRA...")
+        # 既存の設定を無効化して QLoRA を適用できるようにする
+        config.quantization_config = None
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -39,6 +48,7 @@ def train():
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
+        config=config,
         quantization_config=bnb_config,
         device_map="auto", # 2枚のGPUに自動分配
         torch_dtype=torch.bfloat16,
