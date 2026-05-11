@@ -1,108 +1,91 @@
+from unsloth import FastLanguageModel
 import torch
+from trl import SFTTrainer
+from transformers import TrainingArguments
 from datasets import load_dataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling,
-)
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import os
 
-# --- 設定 ---
-MODEL_ID = "openai/gpt-oss-20b" # またはローカルパス
+# --- Config ---
+MODEL_ID = "unsloth/gpt-oss-20b"
+MAX_SEQ_LENGTH = 2048
 DATA_PATH = "train_data.jsonl"
-OUTPUT_DIR = "./output-skeptical-core"
+OUTPUT_DIR = "./output-skeptical-core-0511a"
+
 
 def train():
-    # 1. トークナイザーのロード
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. データセットのロード
-    dataset = load_dataset("json", data_files=DATA_PATH, split="train")
-
-    def tokenize_function(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=1024)
-
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-
-    # 3. モデルのロード (4-bit量子化 & マルチGPU分散)
-    # 既存のconfigを読み込み、もし量子化設定があれば消去する
-    config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-    if hasattr(config, "quantization_config"):
-        print(f"Detected existing quantization config: {config.quantization_config}")
-        print("Overriding with BitsAndBytesConfig for QLoRA...")
-        # 既存の設定を無効化して QLoRA を適用できるようにする
-        config.quantization_config = None
-
-    bnb_config = BitsAndBytesConfig(
+    print(f"Loading model: {MODEL_ID}...")
+    max_memory = {0: "14GB", 1: "14GB"}
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_ID,
+        max_seq_length=MAX_SEQ_LENGTH,
+        dtype=None,
         load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
+        full_finetunign=False,
+        max_memory=max_memory,
+        device_map="auto",
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        config=config,
-        quantization_config=bnb_config,
-        device_map="auto", # 2枚のGPUに自動分配
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        # 4060Ti (Ada) なので Flash Attention 2 を使用
-        attn_implementation="flash_attention_2" if torch.cuda.get_device_capability()[0] >= 8 else "eager"
-    )
-
-    # 4. LoRA設定
-    # GPT-NeoX 系のターゲットモジュールは "query_key_value"
-    lora_config = LoraConfig(
+    model = FastLanguageModel.get_peft_model(
+        model,
         r=16,
-        lora_alpha=32,
-        target_modules=["query_key_value"],
-        lora_dropout=0.05,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        lora_alpha=16,
+        lora_dropout=0.01,
         bias="none",
-        task_type="CAUSAL_LM"
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
     )
 
-    model = prepare_model_for_kbit_training(model)
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    print("Trainable parameters configured.")
 
-    # 5. トレーニング引数
+    dataset = load_dataset("json", data_files=DATA_PATH, split="train")
+    print(f"Dataset loaded with {len(dataset)} examples.")
+
     training_args = TrainingArguments(
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        warmup_steps=5,
+        max_steps=40,
+        learning_rate=5e-5,
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=1,
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=3407,
         output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=1, # VRAM節約のため1
-        gradient_accumulation_steps=16, # 実効バッチサイズ 16*2=32
-        learning_rate=2e-4,
-        num_train_epochs=3,
-        logging_steps=10,
-        save_strategy="epoch",
-        bf16=True, # bf16をサポートするGPU向け
-        gradient_checkpointing=True,
         report_to="none",
-        ddp_find_unused_parameters=False,
     )
 
-    # 6. トレーナー
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        dataset_text_field="text",
+        max_seq_length=MAX_SEQ_LENGTH,
+        dataset_num_proc=2,
+        packing=False,
         args=training_args,
-        train_dataset=tokenized_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
     )
 
-    # 7. 学習開始
-    print("Starting training...")
+    print("Starting training with Unsloth...")
     trainer.train()
 
-    # 8. 保存
-    model.save_pretrained(os.path.join(OUTPUT_DIR, "final_lora"))
-    tokenizer.save_pretrained(os.path.join(OUTPUT_DIR, "final_lora"))
-    print("Training finished and model saved.")
+    save_dir = os.path.join(OUTPUT_DIR, "skeptical_core_lora")
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
+    print(f"Training finished. LoRA saved to {save_dir}")
+
 
 if __name__ == "__main__":
     train()
